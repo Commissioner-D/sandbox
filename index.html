@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d0f0e">
+<title>Tacho</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=Barlow:wght@400;500&display=swap">
+<style>
+/* Instrument cluster: one huge readout, small gauges below, start button at thumb height */
+:root {
+  --bg: #0d0f0e;
+  --panel: #171a19;
+  --line: #2a2f2d;
+  --fg: #eef2ef;
+  --muted: #8b958f;
+  --accent: #f2b33d;
+  --warn: #e0664f;
+  --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --body: "Barlow", system-ui, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--body);
+  display: flex; flex-direction: column;
+  padding-block: max(20px, env(safe-area-inset-top, 0px)) max(20px, env(safe-area-inset-bottom, 0px));
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  -webkit-user-select: none; user-select: none;
+}
+.status { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); display: inline-block; margin-right: 8px; vertical-align: middle; }
+.dot.on { background: var(--accent); }
+.dot.err { background: var(--warn); }
+main { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 0; }
+.speed { font-family: var(--display); font-weight: 600; font-size: min(48vw, 34vh); line-height: .85; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.unit { font-family: var(--display); font-weight: 500; font-size: 22px; color: var(--muted); letter-spacing: .12em; text-transform: uppercase; margin-top: 8px; }
+.gauges { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-block: 20px; }
+.g { padding: 14px 4px; text-align: center; }
+.g + .g { border-left: 1px solid var(--line); }
+.g b { display: block; font-family: var(--display); font-weight: 600; font-size: 30px; font-variant-numeric: tabular-nums; }
+.g span { font-size: 11px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; }
+.row { display: flex; gap: 12px; }
+button { flex: 1; font: 500 18px var(--body); padding: 18px; border-radius: 14px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #1b1404; }
+button:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+.msg { min-height: 1.4em; margin-top: 12px; font-size: 14px; color: var(--muted); text-align: center; }
+.msg.err { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="status">
+  <div><i id="dot" class="dot"></i><span id="gps">GPS aus</span></div>
+  <div id="acc">±– m</div>
+</div>
+
+<main>
+  <div class="speed" id="speed">0</div>
+  <div class="unit">km/h</div>
+</main>
+
+<div class="gauges">
+  <div class="g"><b id="max">0</b><span>Max</span></div>
+  <div class="g"><b id="avg">0</b><span>Ø fahrend</span></div>
+  <div class="g"><b id="dist">0,0</b><span>km</span></div>
+</div>
+
+<div class="row">
+  <button id="toggle" class="primary">Start</button>
+  <button id="reset">Reset</button>
+</div>
+<div class="msg" id="msg">Bildschirm bleibt an, solange die Seite offen ist.</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt0 = n => Math.round(n).toLocaleString('de-AT');
+const fmt1 = n => n.toLocaleString('de-AT', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
+let watchId = null, wakeLock = null, last = null;
+let maxKmh = 0, distM = 0, movingMs = 0;
+
+function msg(t, err) { $('msg').textContent = t; $('msg').className = 'msg' + (err ? ' err' : ''); }
+
+async function lockScreen() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (watchId !== null && document.visibilityState === 'visible') lockScreen();
+});
+
+function onPos(p) {
+  const c = p.coords;
+  let mps = c.speed;
+  if (last) {
+    const dt = (p.timestamp - last.t) / 1000;
+    const d = haversine(last.lat, last.lon, c.latitude, c.longitude);
+    if (mps == null || isNaN(mps)) mps = dt > 0 ? d / dt : 0;
+    if (mps * 3.6 >= 2 && c.accuracy < 50) { distM += d; movingMs += p.timestamp - last.t; }
+  }
+  last = { lat: c.latitude, lon: c.longitude, t: p.timestamp };
+
+  let kmh = (mps || 0) * 3.6;
+  if (kmh < 2) kmh = 0;
+  if (c.accuracy < 50 && kmh > maxKmh) maxKmh = kmh;
+
+  $('speed').textContent = fmt0(kmh);
+  $('max').textContent = fmt0(maxKmh);
+  $('avg').textContent = movingMs > 0 ? fmt0(distM / (movingMs / 1000) * 3.6) : '0';
+  $('dist').textContent = fmt1(distM / 1000);
+  $('acc').textContent = '±' + fmt0(c.accuracy) + ' m';
+  $('gps').textContent = c.accuracy < 30 ? 'GPS gut' : 'GPS ungenau';
+  $('dot').className = 'dot on';
+}
+
+function onErr(e) {
+  $('dot').className = 'dot err';
+  $('gps').textContent = 'GPS Fehler';
+  if (e.code === 1) msg('Standortzugriff verweigert. Erlaube ihn in den Browser-Einstellungen für diese Seite.', true);
+  else msg('Kein GPS-Signal. Unter freiem Himmel klappt es meist nach ein paar Sekunden.', true);
+}
+
+function haversine(a, b, c, d) {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const h = Math.sin(r(c - a) / 2) ** 2 + Math.cos(r(a)) * Math.cos(r(c)) * Math.sin(r(d - b) / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+$('toggle').addEventListener('click', () => {
+  if (watchId === null) {
+    if (!('geolocation' in navigator)) { msg('Dieser Browser kann keinen Standort liefern.', true); return; }
+    watchId = navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+    lockScreen();
+    $('toggle').textContent = 'Stopp';
+    $('toggle').classList.remove('primary');
+    $('gps').textContent = 'Suche GPS …';
+    msg('Bildschirm bleibt an, solange die Seite offen ist.');
+  } else {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null; last = null;
+    try { wakeLock && wakeLock.release(); } catch (e) {}
+    $('toggle').textContent = 'Start';
+    $('toggle').classList.add('primary');
+    $('gps').textContent = 'GPS aus';
+    $('dot').className = 'dot';
+    $('speed').textContent = '0';
+  }
+});
+
+$('reset').addEventListener('click', () => {
+  maxKmh = 0; distM = 0; movingMs = 0;
+  ['max', 'avg'].forEach(id => $(id).textContent = '0');
+  $('dist').textContent = '0,0';
+});
+</script>
+</body>
+</html>
